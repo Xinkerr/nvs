@@ -57,7 +57,8 @@ struct nvs_fs_property
 	uint16_t sector_size;
 	uint16_t sector_count;
 	uint8_t write_block_size;
-	uint8_t erase_value;
+	const uint8_t* erase_value;
+	uint8_t erase_value_len;
 };
 
 /**
@@ -81,7 +82,8 @@ struct nvs_fs {
 	uint16_t sector_size;
 	uint16_t sector_count;
 	uint8_t write_block_size;
-	uint8_t erase_value;
+	const uint8_t* erase_value;
+	uint8_t erase_value_len;
 	bool ready;
 	// struct k_mutex nvs_lock;
 	// const struct device *flash_device;

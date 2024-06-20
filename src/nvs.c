@@ -123,9 +123,10 @@ static int nvs_flash_al_wrt(struct nvs_fs *fs, uint32_t addr, const void *data,
 		data8 += blen;
 	}
 	if (len) {
+		if(fs->ops.read == NULL)
+			return -1;
+		fs->ops.read(offset, buf, fs->write_block_size);
 		memcpy(buf, data8, len);
-		(void)memset(buf + len, fs->erase_value,
-			fs->write_block_size - len);
 
 		if(fs->ops.write == NULL)
 			return -1;
@@ -225,17 +226,29 @@ static int nvs_flash_block_cmp(struct nvs_fs *fs, uint32_t addr, const void *dat
  * value. returns 0 if all data in flash is equal to value, 1 if not equal,
  * errcode if error
  */
-static int nvs_flash_cmp_const(struct nvs_fs *fs, uint32_t addr, uint8_t value,
-				size_t len)
+static int nvs_flash_cmp_const(struct nvs_fs *fs, uint32_t addr, size_t len)
 {
 	int rc;
 	size_t bytes_to_cmp, block_size;
 	uint8_t cmp[NVS_BLOCK_SIZE];
+	int i;
+	const uint8_t* erase_value = fs->erase_value; 
+	uint8_t erase_value_len = fs->erase_value_len;
+
+	if(NVS_BLOCK_SIZE % fs->erase_value_len)
+	{
+		_nvs_LOG_ERR("NVS_BLOCK_SIZE %% fs->erase_value_len != 0");
+		return -EINVAL;
+	}
 
 	block_size =
 		NVS_BLOCK_SIZE & ~(fs->write_block_size - 1U);
 
-	(void)memset(cmp, value, block_size);
+	for(i=0; i<block_size; i+=erase_value_len)
+	{
+		memcpy(cmp+i, erase_value, erase_value_len);
+	}
+
 	while (len) {
 		bytes_to_cmp = MIN(block_size, len);
 		rc = nvs_flash_block_cmp(fs, addr, cmp, bytes_to_cmp);
@@ -300,8 +313,7 @@ static int nvs_flash_erase_sector(struct nvs_fs *fs, uint32_t addr)
 		return rc;
 	}
 
-	if (nvs_flash_cmp_const(fs, addr, fs->erase_value,
-			fs->sector_size)) {
+	if (nvs_flash_cmp_const(fs, addr, fs->sector_size)) {
 		rc = -ENXIO;
 	}
 
@@ -335,18 +347,32 @@ static int nvs_ate_crc8_check(const struct nvs_ate *entry)
  * the whole ATE is equal to value, 1 if not equal.
  */
 
-static int nvs_ate_cmp_const(const struct nvs_ate *entry, uint8_t value)
+static int nvs_ate_cmp_const(struct nvs_fs *fs, const struct nvs_ate *entry)
 {
-	const uint8_t *data8 = (const uint8_t *)entry;
-	int i;
+	int i = 0;
+	uint8_t cmp[sizeof(struct nvs_ate)];
+	const uint8_t* erase_value = fs->erase_value; 
+	uint8_t erase_value_len = fs->erase_value_len;
 
-	for (i = 0; i < sizeof(struct nvs_ate); i++) {
-		if (data8[i] != value) {
-			return 1;
+	while(i < sizeof(struct nvs_ate))
+	{
+		int remaining = sizeof(struct nvs_ate) - i;
+		if(remaining > erase_value_len)
+		{
+			memcpy(cmp+i, erase_value, erase_value_len);
+			i += erase_value_len;
+		}
+		else
+		{
+			memcpy(cmp+i, erase_value, remaining);
+			i += remaining;
 		}
 	}
 
-	return 0;
+	if(memcmp(entry, cmp, sizeof(struct nvs_ate)) == 0)
+		return 0;
+	else
+		return 1;
 }
 
 /* nvs_ate_valid validates an ate:
@@ -489,7 +515,7 @@ static int nvs_prev_ate(struct nvs_fs *fs, uint32_t *addr, struct nvs_ate *ate)
 		return rc;
 	}
 
-	rc = nvs_ate_cmp_const(&close_ate, fs->erase_value);
+	rc = nvs_ate_cmp_const(fs, &close_ate);
 	/* at the end of filesystem */
 	if (!rc) {
 		*addr = fs->ate_wra;
@@ -588,7 +614,7 @@ static int nvs_gc(struct nvs_fs *fs)
 		return rc;
 	}
 
-	rc = nvs_ate_cmp_const(&close_ate, fs->erase_value);
+	rc = nvs_ate_cmp_const(fs, &close_ate);
 	if (!rc) {
 		goto gc_done;
 	}
@@ -693,12 +719,9 @@ static int nvs_startup(struct nvs_fs *fs)
 	 */
 	uint32_t addr = 0U;
 	uint16_t i, closed_sectors = 0;
-	uint8_t erase_value = fs->erase_value;
 
 	if(fs->ops.mutex_lock != NULL)
 		fs->ops.mutex_lock();
-
-	_nvs_LOG_DBG("nvs_startup");
 	
 	ate_size = nvs_al_size(fs, sizeof(struct nvs_ate));
 	/* step through the sectors to find a open sector following
@@ -707,14 +730,12 @@ static int nvs_startup(struct nvs_fs *fs)
 	for (i = 0; i < fs->sector_count; i++) {
 		addr = (i << ADDR_SECT_SHIFT) +
 		       (uint16_t)(fs->sector_size - ate_size);
-		rc = nvs_flash_cmp_const(fs, addr, erase_value,
-					 sizeof(struct nvs_ate));
+		rc = nvs_flash_cmp_const(fs, addr, sizeof(struct nvs_ate));
 		if (rc) {
 			/* closed sector */
 			closed_sectors++;
 			nvs_sector_advance(fs, &addr);
-			rc = nvs_flash_cmp_const(fs, addr, erase_value,
-						 sizeof(struct nvs_ate));
+			rc = nvs_flash_cmp_const(fs, addr, sizeof(struct nvs_ate));
 			if (!rc) {
 				/* open sector */
 				break;
@@ -733,8 +754,7 @@ static int nvs_startup(struct nvs_fs *fs)
 		 * two sectors. Then we can only set it to the first sector if
 		 * the last sector contains no ate's. So we check this first
 		 */
-		rc = nvs_flash_cmp_const(fs, addr - ate_size, erase_value,
-				sizeof(struct nvs_ate));
+		rc = nvs_flash_cmp_const(fs, addr - ate_size, sizeof(struct nvs_ate));
 		if (!rc) {
 			/* empty ate */
 			nvs_sector_advance(fs, &addr);
@@ -763,7 +783,7 @@ static int nvs_startup(struct nvs_fs *fs)
 			goto end;
 		}
 
-		rc = nvs_ate_cmp_const(&last_ate, erase_value);
+		rc = nvs_ate_cmp_const(fs, &last_ate);
 
 		if (!rc) {
 			/* found ff empty location */
@@ -802,7 +822,7 @@ static int nvs_startup(struct nvs_fs *fs)
 	 */
 	addr = fs->ate_wra & ADDR_SECT_MASK;
 	nvs_sector_advance(fs, &addr);
-	rc = nvs_flash_cmp_const(fs, addr, erase_value, fs->sector_size);
+	rc = nvs_flash_cmp_const(fs, addr, fs->sector_size);
 	if (rc < 0) {
 		goto end;
 	}
@@ -852,8 +872,7 @@ static int nvs_startup(struct nvs_fs *fs)
 	while (fs->ate_wra > fs->data_wra) {
 		empty_len = fs->ate_wra - fs->data_wra;
 
-		rc = nvs_flash_cmp_const(fs, fs->data_wra, erase_value,
-				empty_len);
+		rc = nvs_flash_cmp_const(fs, fs->data_wra, empty_len);
 		if (rc < 0) {
 			goto end;
 		}
@@ -958,12 +977,16 @@ int nvs_init(struct nvs_fs *fs, struct nvs_fs_property* property, struct nvs_ops
 {
 	if(ops == NULL || property == NULL)
 		return -1;
+	if(property->erase_value == NULL)
+		return -2;
+	memset(fs, 0, sizeof(struct nvs_fs));
 	memcpy(&fs->ops, ops, sizeof(struct nvs_ops));
 	fs->offset = property->address;
 	fs->sector_count = property->sector_count;
 	fs->sector_size = property->sector_size;
 	fs->write_block_size = property->write_block_size;
 	fs->erase_value = property->erase_value;
+	fs->erase_value_len = property->erase_value_len;
 	return nvs_mount(fs);
 }
 
